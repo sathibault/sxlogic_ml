@@ -1,5 +1,8 @@
 import os
+import json
 import math
+import time
+import uuid
 
 import cv2
 import numpy as np
@@ -76,22 +79,22 @@ def export_cpp_conv2d(bits, W, name, fout):
           file=fout)
     for fo in range(O):
         print('{', end='', file=fout)
+        # volumn initializer is flat
         for y in range(N):
-            print('{', end='', file=fout)
             for x in range(N):
                 vec = ','.join([str(v) for v in W[y,x,:,fo].tolist()])
-                print('{' + vec + '}', end='', file=fout)
+                print(vec, end='', file=fout)
                 if x < N-1:
                     if x > 0 and x%50 == 0:
                         print(',', file=fout)
                     else:
                         print(',', end='', file=fout)
             if y < N-1:
-                print('},', file=fout)
-            elif fo < O-1:
-                print('}},', file=fout)
-            else:
-                print('}}});', file=fout)
+                print(',', file=fout)
+        if fo < O-1:
+            print('},', file=fout)
+        else:
+            print('}});', file=fout)
     print('', file=fout)
 
 
@@ -102,7 +105,52 @@ def export_cpp_bias(bits, bias, name, fout):
     vec = ','.join([str(v) for v in bias])
     print(vec + '});', file=fout)
     print('', file=fout)
-    
+
+
+def gen_graph_id():
+    u = uuid.uuid4().hex
+    return u[0:8] + '.' + u[8:14]
+
+def new_graph():
+    return {'z': gen_graph_id(),
+            'nextid': gen_graph_id(),
+            'y': 56}
+
+def emit_node(graph, params, name, fout):
+    print('  "id": "%s",' % graph['nextid'], file=fout)
+    print('  "type": "%s",' % name, file=fout)
+    print('  "z": "%s",' % graph['z'], file=fout)
+    print('  "_ts": %d,' % int(math.trunc(time.time())), file=fout)
+    print('  "name": "",', file=fout)
+    print('  "x": 723,', file=fout)
+    print('  "y": %d,' % graph['y'], file=fout)
+    for k in params:
+        print('  "%s": %s,' % (k, json.dumps(params[k])), file=fout)
+    graph['nextid'] = gen_graph_id()
+    print('  "wires": ["%s"],' % graph['nextid'], file=fout)
+    print('  "wireports": [0]', file=fout)
+    graph['y'] += 56
+
+def conv2d_coeff_str(W):
+    N = W.shape[0]
+    if W.shape[1] != N:
+        raise Exception('Non-square convolution kernel not implemented')
+    M = W.shape[2]
+    O = W.shape[3]
+    coeff = []
+    for fo in range(O):
+        vk = []
+        for y in range(N):
+            xk = []
+            for x in range(N):
+                vec = W[y,x,:,fo].tolist()
+                xk.append(vec)
+            vk.append(xk)
+        coeff.append(vk)
+    return json.dumps(coeff)
+
+def bias_str(b):
+    return json.dumps(b.tolist())
 
 # output type same as kernel type
 def convolve2D(image, kernel, strides=(1,1)):
@@ -158,6 +206,30 @@ class NpRelu(NpLayer):
 
     def forward(self, X):
         return np.maximum(0, X)
+
+class NpMaxPool2D(NpLayer):
+    def __init__(self, strides):
+        super().__init__()
+        self.strides = strides;
+
+    def forward(self, X):
+        yres = X.shape[0]
+        xres = X.shape[1]
+        NO = X.shape[2]
+
+        dy = self.strides[0]
+        dx = self.strides[1]
+        xres_o = xres//dx
+        yres_o = yres//dy
+
+        out = np.zeros((yres_o, xres_o, NO), dtype=X.dtype)
+        for y in range(yres_o):
+            iy = y*dy
+            for x in range(xres_o):
+                ix = x*dx
+                for fo in range(NO):
+                    out[y, x, fo] = np.max(X[iy:iy+dy, ix:ix+dx, fo])
+        return out
 
 class NpConv2D(NpLayer):
     def __init__(self, strides, weights, bias):
@@ -364,6 +436,10 @@ def keras_to_np_layer(lyr, net):
             net.append(conv)
         else:
             raise Exception('Unimplemented activation: '+cfg['activation'])
+    elif cls == 'MaxPooling2D':
+        if cfg['strides'] != cfg['pool_size']:
+            raise Exception('MaxPooling2D strides != pool_size is not supported')
+        net.append(NpMaxPool2D(cfg['strides']))
     elif cls == 'BatchNormalization':
         W = [w.numpy() for w in lyr.weights]
         net.append(NpBatchNorm(W[0], W[1], W[2], W[3], cfg['epsilon']))
@@ -417,6 +493,10 @@ def merge_layers(layers):
         if idx > 0 and isinstance(lyr, NpConv2D) and isinstance(net[-1], NpBatchNorm):
             [W,b] = fuse_batchnorm_conv2d(net.pop(), lyr)
             net.append(NpConv2D(lyr.strides, W, b))
+        elif idx > 0 and isinstance(lyr, NpMaxPool2D) and isinstance(net[-1], NpBatchNorm):
+            # swap to enable forward merging of batch norm.
+            bn = net.pop()
+            net.extend([lyr, bn])
         else:
             net.append(lyr)
     return net
@@ -440,16 +520,106 @@ class QNNet:
         s = 2**self.qo
         return X.astype(np.float32) / s
 
+    def export_json(self, fout):
+        nc = self.nc
+
+        print("[{", file=fout)
+
+        gr = new_graph()
+        if nc == 1:
+            emit_node(gr, {}, 'CnnInputGr', fout)
+        elif nc == 3:
+            emit_node(gr, {}, 'CnnInputRgb', fout)
+        else:
+            raise Exception('Unexpected number of input channels: '+str(nc))
+
+        bits = 8
+        frac = 7
+        idx = 0
+        while idx < len(self.layers):
+            positive = False
+            lyr = self.layers[idx]
+            if isinstance(lyr, NpLyQuantConv2D):
+                if lyr.strides != (1,1):
+                    raise Exception('Strided convolution not supported for streaming CNN')
+
+                print("},{", file=fout)
+                emit_node(gr, {'v': 'int32_t',
+                               'u': 'int%d_t' % self.wbits,
+                               'n': lyr.W.shape[0],
+                               'o': lyr.W.shape[3],
+                               'coeff': conv2d_coeff_str(lyr.W)},
+                          'CnnConv', fout)
+
+                nxt = idx+1
+                if nxt < len(self.layers) and isinstance(self.layers[nxt], NpRelu):
+                    print("},{", file=fout)
+                    emit_node(gr, {'v': 'int16_t',
+                                   'u': 'int16_t',
+                                   'biases': bias_str(lyr.b),
+                                   'bs': lyr.bshl,
+                                   'rs': lyr.ashr},
+                              'CnnBiasRelu', fout)
+                    idx = nxt
+                    positive = True
+                else:
+                    print("},{", file=fout)
+                    emit_node(gr, {'u': 'int16_t',
+                                   'biases': bias_str(lyr.b),
+                                   's': lyr.bshl},
+                              'CnnBias', fout)
+
+                    print("},{", file=fout)
+                    emit_node(gr, {'u': 'int16_t',
+                                   's': lyr.ashr},
+                              'CnnReduce', fout)
+
+                nc = lyr.W.shape[3]
+                bits = 16
+                frac = lyr.qo
+            elif isinstance(lyr, NpRelu):
+                print("},{", file=fout)
+                emit_node(gr, {}, 'CnnRelu', fout)
+                positive = True
+            elif isinstance(lyr, NpMaxPool2D):
+                print("},{", file=fout)
+                emit_node(gr, {'n': lyr.strides[0],
+                               'm': lyr.strides[1]},
+                          'CnnMaxPool', fout)
+            else:
+                raise Exception('Cannot export layer: ' + lyr.__class__.__name__)
+
+            idx += 1
+
+        if not positive:
+            print("},{", file=fout)
+            emit_node(gr, {}, 'CnnRelu', fout)
+
+        shr = 8 if frac>8 else frac
+        frac -= shr
+        print("},{", file=fout)
+        emit_node(gr, {'u': 'uint8_t',
+                       's': shr},
+                  'CnnReduce', fout)
+        print('WARNING: final output is %d.%d unsigned fixed point' % (8-frac,frac))
+
+        print("},{", file=fout)
+        emit_node(gr, {'u': 'Gray'}, 'ToGray', fout)
+
+
+        print("}]", file=fout)
+
     # Undocumented method used for internal testing
     def export_cpp(self, basename, cout, hout):
         nc = self.nc
         print('#include "sximage.h"', file=cout)
+        print('#include "%s.h"' % (basename,), file=cout)
         print('', file=cout)
 
         if nc == 1:
             print('ImageIn<Gray> src("your test image");', file=cout)
         else:
-            print('ImageIn<Gray> src("your test image");', file=cout)
+            print('ImageIn<Rgb> src("your test image");', file=cout)
         print('ImageOut<Gray> out("%s.png");' % (basename,), file=cout)
         print('', file=cout)
 
@@ -460,6 +630,7 @@ class QNNet:
             print('  src >> CnnInputRgb<Rgb>() >>', file=cout)
         else:
             raise Exception('Unexpected number of input channels: '+str(nc))
+
         bits = 8
         frac = 7
         idx = 0
@@ -468,6 +639,9 @@ class QNNet:
             lyr = self.layers[idx]
             if isinstance(lyr, NpLyQuantConv2D):
                 nc = lyr.W.shape[3]
+                if lyr.strides != (1,1):
+                    raise Exception('Strided convolution not supported for streaming CNN')
+
                 export_cpp_conv2d(self.wbits, lyr.W, '_conv' + str(idx), hout)
                 export_cpp_bias(16, lyr.b, '_bias' + str(idx), hout)
                 print('    CnnConv<int%d_t,int32_t>(_conv%d) >>' % (bits,idx), file=cout)
@@ -478,30 +652,37 @@ class QNNet:
                     positive = True
                 else:
                     print('    CnnBias<int32_t>(_bias%d, %d) >>' % (bits,idx,lyr.bshl), file=cout)
-                    print('    CnnReduce<int32_t,int16_t>(%d) >>' % (lyr.ashr), file=cout)  
+                    print('    CnnReduce<int32_t,int16_t,%d>(%d) >>' % (nc,lyr.ashr), file=cout)
                 bits = 16
                 frac = lyr.qo
             elif isinstance(lyr, NpRelu):
                 print('    CnnRelu<int%d_t,%d>() >>' % (bits,nc), file=cout)
                 positive = True
+            elif isinstance(lyr, NpMaxPool2D):
+                print('    CnnMaxPool<int%d_t,%d,%d,%d>() >>' % (bits,lyr.strides[0],lyr.strides[1],nc), file=cout)
             else:
                 raise Exception('Cannot export layer: ' + lyr.__class__.__name__)
             idx += 1
+
         if not positive:
             print('    CnnRelu<int%d_t,%d>() >>' % (bits,nc), file=cout)
         shr = 8 if frac>8 else frac
         frac -= shr
-        print('    CnnReduce<int16_t,uint8_t>(%d) >>' % (shr), file=cout)
+        print('    CnnReduce<int16_t,uint8_t,%d>(%d) >>' % (nc,shr), file=cout)
+        print('    ToGray<Vec<uint8_t,1>,Gray>() >>', file=cout)
         print('    out;', file=cout)
         print('  return 0;', file=cout)
         print('}', file=cout)
         print('WARNING: final output is %d.%d unsigned fixed point' % (8-frac,frac))
+
     def export(self, filename):
         basename = os.path.splitext(os.path.basename(filename))[0]
         fout = open(filename, 'w')
         if filename.endswith('.cpp'):
             hout = open(os.path.splitext(filename)[0] + '.h', 'w')
             self.export_cpp(basename, fout, hout)
+        elif filename.endswith('.json'):
+            self.export_json(fout)
 
 class NNet:
     def __init__(self, layers):
@@ -522,7 +703,7 @@ class NNet:
     def quantize(self, files, wbits=8, debug=False):
         for lyr in self.layers:
             lyr.track = True
-                
+
         nf = len(files)
         print('Analyzed %d of %d' % (0,nf), end='')
         for idx,filename in enumerate(files):
@@ -544,6 +725,8 @@ class NNet:
                 conv = quantize_conv2d(lyr, param, wbits, debug)
                 net.append(conv)
                 qo = conv.qo
+            elif isinstance(lyr, NpBatchNorm):
+                raise Exception('Failed to merge all batch normalization layers')
             else:
                 net.append(lyr)
         if not isinstance(net[-1], NpRelu):
